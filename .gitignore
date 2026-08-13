@@ -75,6 +75,7 @@ desktop.ini
 *.epf.bak
 *.erf.bak
 *.dt.bak
+.bsl-language-server.json
 
 # Native components
 # Template.bin files are compiled DLLs, generated at build time
@@ -92,3 +93,4 @@ dist/
 # IDE
 *.sublime-project
 *.sublime-workspace
+.cursor
