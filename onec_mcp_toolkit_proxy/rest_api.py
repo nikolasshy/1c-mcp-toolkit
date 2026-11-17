@@ -31,9 +31,48 @@ from .tools import (
     SubmitForDeanonymizationParams,
     GetScreenshotParams,
 )
-from .channel_registry import ChannelRegistry, DEFAULT_CHANNEL
+from .channel_registry import ChannelRegistry, DEFAULT_CHANNEL, CHANNEL_ID_PATTERN
+from .anonymizer.registry import AnonymizerRegistry
+from .anonymizer.token_mapper import TOKEN_RE
 
 logger = logging.getLogger(__name__)
+
+
+async def deanonymize_handler(request: Request) -> JSONResponse:
+    """Restore text locally; this route is deliberately not an MCP tool."""
+    def reply(value, status=200):
+        return JSONResponse(value, status_code=status, headers={"Cache-Control": "no-store"})
+
+    if not settings.deanonymization_api_enabled:
+        return reply({"success": False, "error": "Not Found"}, 404)
+    if request.method != "POST":
+        return reply({"success": False, "error": "Method not allowed"}, 405)
+    if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json":
+        return reply({"success": False, "error": "Content-Type must be application/json"}, 415)
+    # Never use scope['channel']: ChannelMiddleware can bind it to an MCP session.
+    channels = request.query_params.getlist("channel")
+    channel = channels[0] if channels else DEFAULT_CHANNEL
+    if len(channels) > 1 or not CHANNEL_ID_PATTERN.fullmatch(channel):
+        return reply({"success": False, "error": "Invalid channel"}, 400)
+    try:
+        body, parse_error = await _parse_json_body_with_encoding_detection(request)
+        if parse_error:
+            return reply({"success": False, "error": "Expected a JSON object"}, 400)
+        if set(body) != {"text"} or not isinstance(body["text"], str):
+            return reply({"success": False, "error": "Expected only the string field text"}, 422)
+        # No awaits between selecting the current owner and reading its mapping.
+        anon = AnonymizerRegistry.get_if_exists(channel)
+        if anon is None:
+            unresolved = {}
+            for match in TOKEN_RE.finditer(body["text"]):
+                unresolved.setdefault(match.group(0).upper(), match.group(0))
+            text, missing = body["text"], list(unresolved.values())
+        else:
+            text, missing = anon.mapper.detokenize_with_unresolved(body["text"])
+        return reply({"success": True, "text": text, "unresolved_tokens": missing})
+    except Exception:
+        # Neither input nor restored data belongs in an error or command journal.
+        return reply({"success": False, "error": "Text restoration failed"}, 500)
 
 
 def _get_channel(request: Request) -> str:
@@ -659,9 +698,34 @@ async def get_metadata_handler(request: Request) -> JSONResponse:
         attribute_mask = request.query_params.get("attribute_mask")
         limit_str = request.query_params.get("limit")
         offset_str = request.query_params.get("offset")
+        types_limit_str = request.query_params.get("types_limit")
+        types_offset_str = request.query_params.get("types_offset")
         sections = _parse_csv_or_repeated_query_param(request, "sections")
         # extension_name: None if not in query string, "" if present but empty
         extension_name = request.query_params.get("extension_name")
+
+        # Step 2.1: Repeated types_limit/types_offset with DIFFERENT values are ambiguous -> 422.
+        # (query_params.get keeps the last value; the built-in 1C server sees the raw list —
+        # both must reject instead of silently choosing different pages.)
+        for types_param_name, types_param_value in (("types_limit", types_limit_str), ("types_offset", types_offset_str)):
+            repeated_values = request.query_params.getlist(types_param_name)
+            if len(repeated_values) > 1 and len(set(repeated_values)) > 1:
+                return JSONResponse(
+                    status_code=422,
+                    content={
+                        "success": False,
+                        "error": f"Ошибка валидации: параметр {types_param_name} передан несколько раз с разными значениями / "
+                                 f"Validation error: parameter '{types_param_name}' is ambiguous (repeated with different values)",
+                        "details": [
+                            {
+                                "loc": [types_param_name],
+                                "msg": "parameter repeated with different values",
+                                "type": "value_error.ambiguous",
+                                "input": repeated_values
+                            }
+                        ]
+                    }
+                )
         
         # Step 3: Parse limit parameter (validate it's a valid integer)
         limit = 100  # default
@@ -709,6 +773,51 @@ async def get_metadata_handler(request: Request) -> JSONResponse:
                     }
                 )
         
+        # Step 3.2: Parse types_limit/types_offset query params (same 422 contract as limit/offset)
+        types_limit: Optional[int] = None
+        if types_limit_str is not None:
+            try:
+                types_limit = int(types_limit_str)
+            except ValueError:
+                return JSONResponse(
+                    status_code=422,
+                    content={
+                        "success": False,
+                        "error": f"Ошибка валидации: types_limit должен быть целым числом, получено '{types_limit_str}' / "
+                                 f"Validation error: types_limit must be an integer, got '{types_limit_str}'",
+                        "details": [
+                            {
+                                "loc": ["types_limit"],
+                                "msg": f"value is not a valid integer",
+                                "type": "int_parsing",
+                                "input": types_limit_str
+                            }
+                        ]
+                    }
+                )
+
+        types_offset: Optional[int] = None
+        if types_offset_str is not None:
+            try:
+                types_offset = int(types_offset_str)
+            except ValueError:
+                return JSONResponse(
+                    status_code=422,
+                    content={
+                        "success": False,
+                        "error": f"Ошибка валидации: types_offset должен быть целым числом, получено '{types_offset_str}' / "
+                                 f"Validation error: types_offset must be an integer, got '{types_offset_str}'",
+                        "details": [
+                            {
+                                "loc": ["types_offset"],
+                                "msg": f"value is not a valid integer",
+                                "type": "int_parsing",
+                                "input": types_offset_str
+                            }
+                        ]
+                    }
+                )
+
         # Step 4: Validate parameters via Pydantic
         try:
             validated_params = validate_get_metadata_params(
@@ -719,7 +828,9 @@ async def get_metadata_handler(request: Request) -> JSONResponse:
                 sections=sections,
                 offset=offset,
                 extension_name=extension_name,
-                attribute_mask=attribute_mask
+                attribute_mask=attribute_mask,
+                types_limit=types_limit,
+                types_offset=types_offset
             )
         except ValidationError as e:
             return _validation_error_response(e)
@@ -745,6 +856,8 @@ async def get_metadata_handler(request: Request) -> JSONResponse:
         sections = body.get("sections")
         extension_name = body.get("extension_name")
         attribute_mask = body.get("attribute_mask")
+        types_limit = body.get("types_limit")
+        types_offset = body.get("types_offset")
 
         # Step 5: Validate parameters via Pydantic
         try:
@@ -756,7 +869,9 @@ async def get_metadata_handler(request: Request) -> JSONResponse:
                 sections=sections,
                 offset=offset,
                 extension_name=extension_name,
-                attribute_mask=attribute_mask
+                attribute_mask=attribute_mask,
+                types_limit=types_limit,
+                types_offset=types_offset
             )
         except ValidationError as e:
             return _validation_error_response(e)

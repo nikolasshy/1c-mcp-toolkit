@@ -14,6 +14,7 @@ Validates: Requirements 2.1, 3.1, 4.1, Event Log 1.1
 """
 
 import asyncio
+import anyio
 import json
 import logging
 import unicodedata
@@ -22,7 +23,7 @@ from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ImageContent, TextContent
-from pydantic import Field, ValidationError
+from pydantic import Field, ValidationError, BeforeValidator
 
 from .command_queue import channel_command_queue
 from .config import settings
@@ -34,6 +35,7 @@ from .tools import (
     validate_execute_code_params,
     validate_get_metadata_params,
     validate_get_event_log_params,
+    validate_types_int_input,
     validate_get_object_by_link_params,
     validate_get_link_of_object_params,
     validate_find_references_to_object_params,
@@ -300,6 +302,49 @@ mcp = FastMCP(
 
 
 async def _execute_1c_command(tool: str, params: Dict[str, Any], channel: str = "default", timeout: Optional[float] = None) -> Dict[str, Any]:
+    from .consumer_registry import consumer_registry, current_consumer, ConsumerChanged
+    duration = float(timeout if timeout is not None else settings.timeout)
+    async def bound_call():
+        # Bound the initial wait only; dictionary commands have their own timeouts.
+        with anyio.fail_after(duration):
+            owner = await consumer_registry.wait(channel)
+        token = current_consumer.set(owner)
+        try:
+            if owner.mode == 'server_host':
+                from .consumer_registry import HOST_TOOLS
+                if tool not in HOST_TOOLS:
+                    reason = {
+                        'get_screenshot': 'нет клиентского интерфейса для захвата экрана',
+                        'restart_1c_session': 'нет клиентского сеанса для закрытия или перезапуска',
+                        'close_1c_session': 'нет клиентского сеанса для закрытия или перезапуска',
+                        'submit_for_deanonymization': 'нет пользовательского интерфейса для подтверждения деанонимизации',
+                    }.get(tool, 'эта команда не поддерживается при серверном запуске')
+                    return {'success': False, 'error': f'Инструмент {tool} недоступен: обработка работает на сервере 1С, {reason}.'}
+                if tool == 'execute_code' and params.get('execution_context') == 'client':
+                    return {'success': False, 'error': 'execute_code с execution_context="client" недоступен: обработка работает на сервере 1С. Поддерживается только execution_context="server".'}
+                if tool not in owner.tools:
+                    return {'success': False, 'error': f'Инструмент {tool} недоступен в текущем серверном подключении.'}
+                if owner.anon_confirm and tool not in ('get_metadata', 'get_link_of_object', 'get_bsl_syntax_help'):
+                    return {'success': False, 'error': 'Для передачи данных требуется подтверждение анонимизации в клиентском режиме.'}
+                if tool != "get_bsl_syntax_help":
+                    (await AnonymizerRegistry.get_async(channel)).mapper.validate_tokens(params)
+            result = await _execute_bound_1c_command(tool, params, channel, duration)
+            consumer_registry.check(owner)
+            return result
+        finally:
+            current_consumer.reset(token)
+    try:
+        return await bound_call()
+    except (TimeoutError, asyncio.TimeoutError):
+        return {'success': False, 'error': 'Timeout waiting for the 1C consumer or its response'}
+    except (ConsumerChanged, ValueError):
+        return {'success': False, 'error': '1C owner changed or anonymization token is unknown; request fresh data'}
+    except Exception:
+        logger.exception('Failed to finalize 1C command')
+        return {'success': False, 'error': 'Proxy could not safely process the command; no source data returned'}
+
+
+async def _execute_bound_1c_command(tool: str, params: Dict[str, Any], channel: str = "default", timeout: Optional[float] = None) -> Dict[str, Any]:
     """
     Execute a command on the 1C client and wait for the result.
 
@@ -330,16 +375,21 @@ async def _execute_1c_command(tool: str, params: Dict[str, Any], channel: str = 
             "1C processing might be disconnected or slow."
         )
     
-    # Determine if anonymization should be applied for this tool
+    from .consumer_registry import current_consumer
+    owner = current_consumer.get()
+    server_help = owner is not None and owner.mode == 'server_host' and tool == 'get_bsl_syntax_help'
+
+    # Documentation is literal in server-host mode; ordinary clients retain their policy.
     _do_anon = (
         settings.anonymization_enabled
+        and not server_help
         and tool in settings.anonymization_tools
     )
     requested_schema = bool(params.get("include_schema", False)) if tool == "execute_query" else False
 
     # De-tokenize params before sending to 1C
     if _do_anon:
-        anon = AnonymizerRegistry.get(channel)
+        anon = await AnonymizerRegistry.get_async(channel)
         await AnonymizerRegistry.ensure_dictionary_loaded(channel)
         params = anon.detokenize_params_for_tool(params, tool)
         # Request-boundary eviction: prune AFTER detokenization so tokens this
@@ -348,6 +398,14 @@ async def _execute_1c_command(tool: str, params: Dict[str, Any], channel: str = 
         # regardless of tool or whether params existed. No-op when cap is 0.
         anon.prune()
 
+    if not _do_anon:
+        from .consumer_registry import current_consumer
+        owner = current_consumer.get()
+        if owner is not None and owner.mode == 'server_host' and not server_help:
+            anon = await AnonymizerRegistry.get_async(channel)
+            params = anon.detokenize_params_for_tool(params, tool)
+            anon.prune()
+
     params_for_1c = dict(params)
     if _do_anon and tool == "execute_query":
         # Schema is needed internally for anonymization even when the agent did not
@@ -355,9 +413,11 @@ async def _execute_1c_command(tool: str, params: Dict[str, Any], channel: str = 
         params_for_1c["include_schema"] = True
 
     # Add command to channel queue
-    command_id = await channel_command_queue.add_command(channel, tool, params_for_1c)
+    # Preparation does not consume the timeout of the command itself.
+    command_id = await channel_command_queue.add_command(channel, tool, params_for_1c, timeout=effective_timeout)
     logger.info(f"Command {command_id} added to channel '{channel}': tool={tool}")
-    
+
+    source_metadata = {}
     try:
         # Wait for result with timeout (non-blocking for other operations)
         # Validates: Requirement 6.3 - timeout doesn't block proxy for other operations
@@ -366,6 +426,10 @@ async def _execute_1c_command(tool: str, params: Dict[str, Any], channel: str = 
             timeout=effective_timeout
         )
         logger.info(f"Command {command_id} completed successfully on channel '{channel}'")
+        from .consumer_registry import check_current
+        check_current()
+        if isinstance(result, dict) and "base" in result:
+            source_metadata = {"base": result["base"]}
 
         # Anonymize response before formatting
         if _do_anon:
@@ -377,6 +441,12 @@ async def _execute_1c_command(tool: str, params: Dict[str, Any], channel: str = 
         elif _do_anon and tool == "execute_query" and requested_schema and isinstance(result, dict):
             result = _strip_internal_execute_query_schema_fields(result)
 
+        from .consumer_registry import current_consumer
+        owner = current_consumer.get()
+        if owner is not None and owner.mode == 'server_host' and tool == 'get_object_by_link' and isinstance(result, dict):
+            result = dict(result)
+            result.pop('schema', None)
+
         # Format result based on configuration (Requirement 2.1, 2.2, 5.1, 5.2, 5.3)
         return format_tool_result(result, settings.response_format)
     except asyncio.TimeoutError:
@@ -387,20 +457,30 @@ async def _execute_1c_command(tool: str, params: Dict[str, Any], channel: str = 
             "error": f"Таймаут ожидания ответа от 1С на канале '{channel}' (>{effective_timeout}с). "
                      "Убедитесь, что клиент 1С подключён с тем же channel ID. / "
                      f"Timeout waiting for 1C response on channel '{channel}' (>{effective_timeout}s). "
-                     "Make sure 1C client is connected with the same channel ID."
+                     "Make sure 1C client is connected with the same channel ID.",
+            **source_metadata,
         }
     except KeyError as e:
         logger.error(f"Command {command_id} not found: {e}")
         return {
             "success": False,
-            "error": f"Команда не найдена: {e} / Command not found: {e}"
+            "error": f"Команда не найдена: {e} / Command not found: {e}",
+            **source_metadata,
         }
     except Exception as e:
         # Catch any unexpected errors
+        from .consumer_registry import current_consumer
+        owner = current_consumer.get()
+        if owner is not None and owner.mode == 'server_host':
+            if source_metadata:
+                logger.exception('Failed to finalize the received 1C result')
+                return {"success": False, "error": "Proxy could not safely process the command; no source data returned", **source_metadata}
+            raise
         logger.exception(f"Unexpected error executing command {command_id}: {e}")
         return {
             "success": False,
-            "error": f"Внутренняя ошибка прокси: {str(e)} / Internal proxy error: {str(e)}"
+            "error": f"Внутренняя ошибка прокси: {str(e)} / Internal proxy error: {str(e)}",
+            **source_metadata,
         }
 
 
@@ -635,7 +715,9 @@ async def get_metadata(
     sections: Optional[List[str]] = None,
     offset: int = 0,
     extension_name: Optional[str] = None,
-    attribute_mask: Optional[str] = None
+    attribute_mask: Optional[str] = None,
+    types_limit: Optional[Annotated[int, BeforeValidator(validate_types_int_input)]] = None,
+    types_offset: Optional[Annotated[int, BeforeValidator(validate_types_int_input)]] = None
 ) -> Dict[str, Any]:
     """
     Get metadata information about 1C database objects.
@@ -688,6 +770,21 @@ async def get_metadata(
        INCOMPATIBLE with sections (returns error). Round-trip for details:
          pass data[0]["ПолноеИмя"] as filter, then use sections.
 
+    6. Paginated types of one typed field: filter + types_limit/types_offset
+       filter points to a single typed field (Реквизит/СтандартныйРеквизит/Измерение/Ресурс/
+       РеквизитАдресации/ТЧ...Реквизит, e.g. "Справочник.Объект.Реквизит.Статус").
+       In ANY structure response each field's Тип shows at most 20 type names; when any field
+       of an array has more than 20 types, columns total_types_count/shown_types_count are
+       added to ALL rows of that array (per-array decision). The addressed field response
+       returns Тип (same <=20 rule) plus data.types = {count, limit, offset, returned,
+       truncated, has_more, next_offset, items[]} with full type strings.
+       Continue with types_offset=types.next_offset while types.has_more=true; starting from
+       types_offset=shown_types_count returns the remaining types of a shortened field.
+       types_limit (default 100, max 200) / types_offset (default 0, max 1000000) are
+       FORBIDDEN for object/tabular-section structure requests and incompatible with
+       attribute_mask, meta_type, name_mask, extension_name="". Existing limit/offset
+       do NOT paginate types.
+
     Args:
         ctx: MCP Context (injected automatically)
         filter: Full name of object (e.g., "Справочник.Номенклатура") or full path to collection element
@@ -705,6 +802,13 @@ async def get_metadata(
                        Returns list contract: data=[{ПолноеИмя, Синоним},...].
                        ПолноеИмя can be used directly as filter (round-trip).
                        INCOMPATIBLE with sections (returns error).
+        types_limit: Page size for the full list of allowed types of ONE addressed typed field
+                    (default 100, max 200). Forbidden for structure requests; incompatible with
+                    attribute_mask/meta_type/name_mask/extension_name="". limit/offset do NOT
+                    paginate types.
+        types_offset: Offset in the types list of one addressed typed field (default 0).
+                     Continue with types.next_offset while types.has_more=true;
+                     types_offset=shown_types_count returns the remaining types of a shortened field.
 
     Returns:
         Dictionary with:
@@ -768,7 +872,7 @@ async def get_metadata(
         get_metadata(filter=matches[0]["ПолноеИмя"], sections=["properties"])
     """
     channel = _get_channel_from_context(ctx)
-    logger.info(f"get_metadata on channel '{channel}': filter={filter}, meta_type={meta_type}, name_mask={name_mask}, limit={limit}, offset={offset}, extension_name={extension_name}, attribute_mask={attribute_mask}")
+    logger.info(f"get_metadata on channel '{channel}': filter={filter}, meta_type={meta_type}, name_mask={name_mask}, limit={limit}, offset={offset}, extension_name={extension_name}, attribute_mask={attribute_mask}, types_limit={types_limit}, types_offset={types_offset}")
 
     # Validate parameters using Pydantic model
     # Validates: Requirement 6.4 - JSON serialization/deserialization errors with clear messages
@@ -781,7 +885,9 @@ async def get_metadata(
             sections=sections,
             offset=offset,
             extension_name=extension_name,
-            attribute_mask=attribute_mask
+            attribute_mask=attribute_mask,
+            types_limit=types_limit,
+            types_offset=types_offset
         )
     except ValidationError as e:
         error_msg = e.errors()[0]['msg'] if e.errors() else str(e)
@@ -1429,14 +1535,37 @@ async def get_screenshot(
     show_grid: bool = False,
     region: Optional[RegionParams] = None,
     highlight_rects: Optional[Annotated[List[HighlightRectItem], Field(max_length=20)]] = None,
+    link: Optional[str] = None,
+    page_name: Optional[str] = None,
 ) -> Union[List[Union[ImageContent, TextContent]], ImageContent, Dict[str, Any]]:
     """
-    Take a screenshot of the active 1C application window and return it as base64 PNG.
+    Captures the main 1C window, including open dropdowns, menus and dialogs.
+    To capture an already open dropdown, omit form_name.
+    With form_name or link the capture starts only after the form has had time to render
+    (~1.5 s wait, activation, ~0.7 s more).
+    If capture_complete is false, some visible overlays could not be captured.
 
     Args:
         form_name: Optional. Full 1C form name (e.g. "Справочник.Контрагенты.Форма.ФормаЭлемента").
-                   If provided, opens the form before capturing the window, then automatically closes the form.
-                   If omitted, captures the current active 1C window immediately.
+                   If provided, opens the form (or activates it if already open), waits ~1.5 s for it
+                   to render, activates the form, waits ~0.7 s more and only then captures the window.
+                   The form is closed afterwards only if this request opened it; an already open form remains open.
+                   Opening a form dismisses any layer that was open, so omit it when the point of the
+                   screenshot is to see an open list or menu.
+                   If omitted, captures the current 1C main window immediately.
+                   Mutually exclusive with link.
+        link: Optional. Navigation link of an existing 1C object
+              (e1cib/data/<Type>.<Name>?ref=<32 hex>), e.g. returned by get_link_of_object.
+              Finds an already open form of this object or opens it via a single navigation,
+              then follows the same wait/activate/capture sequence as form_name.
+              The form is closed afterwards only if this request opened it.
+              If several forms of the same object are open, returns an ambiguity error.
+              External data source links are not supported. Mutually exclusive with form_name.
+        page_name: Optional. Internal name of a form page (tab) element to show before capture
+                   (e.g. "ДополнительныеСведения") — not the visible tab title. Parent page
+                   groups are switched as needed for nested pages. Requires form_name or link.
+                   After capture, pages changed by this request are restored in an already
+                   open form unless the user switched them meanwhile.
         scale_percent: Output image scale (10–200, default 100). Values above 100 produce a larger
                        image with more detail (e.g. 200 = 2× size). Values below 100 produce a smaller
                        image (e.g. 50 = half size). Grid coordinate labels always show original window
@@ -1464,6 +1593,8 @@ async def get_screenshot(
     try:
         validated = GetScreenshotParams(
             form_name=form_name,
+            link=link,
+            page_name=page_name,
             scale_percent=scale_percent,
             show_grid=show_grid,
             region=region,
@@ -1478,6 +1609,10 @@ async def get_screenshot(
     }
     if validated.form_name is not None:
         params["form_name"] = validated.form_name
+    if validated.link is not None:
+        params["link"] = validated.link
+    if validated.page_name is not None:
+        params["page_name"] = validated.page_name
     if validated.region is not None:
         params["region"] = validated.region.model_dump()
     if validated.highlight_rects is not None and len(validated.highlight_rects.root) > 0:
@@ -1499,11 +1634,27 @@ async def get_screenshot(
         )
         window_rect = result.get("window_rect")
         grid_coords = result.get("grid_coords")
+        overlays = result.get("overlays")
         if isinstance(window_rect, dict):
             parts: list = [image, TextContent(type="text", text=json.dumps(window_rect))]
             if isinstance(grid_coords, dict):
                 parts.append(TextContent(type="text", text=json.dumps(grid_coords)))
+            if overlays is not None:
+                # One block, not three: completeness without the failure list is useless, and a
+                # layer list without completeness does not say whether the whole frame is there.
+                layers: Dict[str, Any] = {"overlays": overlays}
+                if result.get("capture_complete") is not None:
+                    layers["capture_complete"] = result["capture_complete"]
+                if result.get("overlay_failures") is not None:
+                    layers["overlay_failures"] = result["overlay_failures"]
+                if result.get("foreground_window") is not None:
+                    layers["foreground_window"] = result["foreground_window"]
+                parts.append(TextContent(type="text", text=json.dumps(layers)))
+            if "base" in result:
+                parts.append(TextContent(type="text", text=json.dumps({"base": result["base"]}, ensure_ascii=False)))
             return parts
+        if "base" in result:
+            return [image, TextContent(type="text", text=json.dumps({"base": result["base"]}, ensure_ascii=False))]
         return image
     return result
 
@@ -1582,6 +1733,25 @@ def _apply_anonymization_notice_to_tools() -> None:
             tool.description = (tool.description or "") + notice
 
 _apply_anonymization_notice_to_tools()
+
+
+@mcp._mcp_server.list_tools()
+async def _list_channel_tools():
+    from .consumer_registry import consumer_registry
+    channel = _get_channel_from_context(mcp.get_context())
+    owner = consumer_registry.consumers.get(channel)
+    tools = await mcp.list_tools()
+    if owner and owner.retired and owner.mode == 'server_host':
+        return []
+    if owner and not owner.retired and owner.mode == 'server_host':
+        tools = [tool.model_copy(deep=True) for tool in tools if tool.name in owner.tools]
+        for tool in tools:
+            if tool.name == 'execute_code':
+                tool.inputSchema['properties']['execution_context']['enum'] = ['server']
+            if settings.anonymization_enabled and tool.name in settings.anonymization_tools:
+                description = (tool.description or '').split('\n\nNOTE: Anonymization is enabled for this tool.')[0]
+                tool.description = description + '\nAnonymization tokens use [CATEGORY-GENERATION-NNNNN]. Pass tokens unchanged in subsequent requests. Request fresh data after a restart; tokens from another generation are rejected.'
+    return tools
 
 
 def get_mcp_server() -> FastMCP:
